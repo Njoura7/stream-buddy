@@ -92,7 +92,7 @@ export default function BuddyScreen() {
         rate: 0.9,
         voice,
         onDone: resolve,
-        onError: resolve,
+        onError: () => resolve(),
         onStopped: resolve,
       });
     });
@@ -115,7 +115,7 @@ export default function BuddyScreen() {
     }
   }, [speak]);
 
-  // ─── Native recording (Expo Go — no free STT, user types) ───────────────
+  // ─── Native recording → Groq Whisper STT ───────────────────────────────
   const startNativeRecording = useCallback(async () => {
     try {
       await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
@@ -135,16 +135,61 @@ export default function BuddyScreen() {
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     } catch (e) {
       console.warn("Recording error:", e);
+      setErrorMsg("Could not start recording. Check mic permissions.");
     }
   }, []);
 
   const stopNativeRecording = useCallback(async () => {
     setMicLevel(0);
-    if (!recordingRef.current) return;
-    try { await recordingRef.current.stopAndUnloadAsync(); } catch {}
+    const rec = recordingRef.current;
+    if (!rec) return;
+
+    let uri: string | null = null;
+    try {
+      await rec.stopAndUnloadAsync();
+      uri = rec.getURI() ?? null;
+    } catch (e) {
+      console.warn("Stop recording error:", e);
+    }
     recordingRef.current = null;
-    setStatusSync("idle");
-  }, []);
+
+    if (!uri) { setStatusSync("idle"); return; }
+
+    // Send to Groq Whisper
+    setStatusSync("thinking");
+    try {
+      const key = process.env.EXPO_PUBLIC_GROQ_KEY;
+      if (!key || key === "your_groq_api_key_here") {
+        setErrorMsg("Missing Groq key in .env");
+        setStatusSync("idle");
+        return;
+      }
+      const form = new FormData();
+      // React Native FormData accepts { uri, name, type } objects directly
+      form.append("file", { uri, name: "audio.m4a", type: "audio/m4a" } as any);
+      form.append("model", "whisper-large-v3-turbo");
+      form.append("language", "en");
+
+      const res = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${key}` },
+        body: form,
+      });
+
+      if (!res.ok) throw new Error(`${res.status}`);
+      const data = await res.json();
+      const text = (data.text ?? "").trim();
+      if (text) {
+        processText(text);
+      } else {
+        setErrorMsg("No speech detected. Hold longer and speak clearly.");
+        setStatusSync("idle");
+      }
+    } catch (e: any) {
+      setErrorMsg(`Transcription failed: ${e.message}`);
+      setStatusSync("idle");
+    }
+  }, [processText]);
 
   // ─── Web recording: MediaRecorder → Groq Whisper STT ───────────────────
   const startWebRecording = useCallback(async () => {
@@ -292,7 +337,7 @@ export default function BuddyScreen() {
               <Text style={styles.micHint}>
                 {Platform.OS === "web"
                   ? "Hold mic → speak → release → Buddy answers"
-                  : "Type below or hold mic to record"}
+                  : "Hold mic → speak → release → Buddy answers"}
               </Text>
             </Animated.View>
 
